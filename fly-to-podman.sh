@@ -31,10 +31,16 @@ migrate_volumes() {
     PODMAN_VOLUMES_PATH=$(podman info --format json | jq -r '.store.volumePath')
     DOCKER_VOLUMES_PATH="/var/lib/docker/volumes"
 
+    RSYNC_OPTS=""
+    if [[ "$UID" -ne 0 ]]; then
+        # If not running as root, make sure to chown the files to the current user
+        RSYNC_OPTS+=" --chown=$(id -u):$(id -g)"
+    fi
+
     for volume in $(docker volume ls --format json | jq -r '.Name'); do
         echo "Migrating volume: $volume"
         podman volume create "$volume" &&
-            sudo rsync -a "$DOCKER_VOLUMES_PATH/$volume/_data/" "$PODMAN_VOLUMES_PATH/$volume/_data"
+            sudo rsync -a "$RSYNC_OPTS" "$DOCKER_VOLUMES_PATH/$volume/_data/" "$PODMAN_VOLUMES_PATH/$volume/_data"
     done
 }
 
