@@ -38,6 +38,79 @@ migrate_volumes() {
     done
 }
 
+# Migrate networks
+migrate_networks() {
+    echo "Migrating Docker networks to Podman..."
+
+    # Get all Docker networks
+    for network in $(docker network ls --format '{{json . }}' | jq -r '.Name'); do
+        echo "Processing network: $network"
+
+        # Skip default Docker networks
+        if [[ "$network" == "host" || "$network" == "none" ]]; then
+            echo "Skipping network: $network (Podman does not need it)"
+            continue
+        fi
+
+        # Extract network details
+        NETWORK_JSON=$(docker network inspect "$network" | jq '.[0]')
+        DRIVER=$(echo "$NETWORK_JSON" | jq -r '.Driver')
+        SUBNET=$(echo "$NETWORK_JSON" | jq -r '.IPAM.Config[0].Subnet // empty')
+        GATEWAY=$(echo "$NETWORK_JSON" | jq -r '.IPAM.Config[0].Gateway // empty')
+        IP_RANGE=$(echo "$NETWORK_JSON" | jq -r '.IPAM.Config[0].IPRange // empty')
+
+        # Check if the network already exists in Podman
+        if podman network exists "$network"; then
+            echo "Network $network already exists in Podman. Skipping creation."
+            continue
+        fi
+
+        # Build the Podman network create command
+        PODMAN_NET_CMD="podman network create"
+
+        # Add driver (Podman supports `bridge`, `ipvlan` and `macvlan`)
+        case "$DRIVER" in
+        "bridge")
+            PODMAN_NET_CMD+=" --driver bridge"
+            ;;
+        "macvlan")
+            PODMAN_NET_CMD+=" --driver macvlan"
+            ;;
+        "ipvlan")
+            PODMAN_NET_CMD+=" --driver ipvlan"
+            ;;
+        *)
+            echo "Warning: Unsupported network driver '$DRIVER' in Podman. Using default bridge."
+            PODMAN_NET_CMD+=" --driver bridge"
+            ;;
+        esac
+
+        # Add subnet configuration if available
+        if [[ -n "$SUBNET" ]]; then
+            PODMAN_NET_CMD+=" --subnet $SUBNET"
+        fi
+
+        # Add gateway if available
+        if [[ -n "$GATEWAY" ]]; then
+            PODMAN_NET_CMD+=" --gateway $GATEWAY"
+        fi
+
+        # Add IP range if available
+        if [[ -n "$IP_RANGE" ]]; then
+            PODMAN_NET_CMD+=" --ip-range $IP_RANGE"
+        fi
+
+        # Finalize the command with network name
+        PODMAN_NET_CMD+=" $network"
+
+        # Create the Podman network
+        echo "Creating Podman network: $network"
+        eval "$PODMAN_NET_CMD" && echo "Network $network migrated successfully." ||
+            echo "Failed to migrate network: $network"
+
+    done
+}
+
 # Migrate containers
 migrate_containters() {
     echo "Migrating Docker containers to Podman..."
@@ -100,8 +173,39 @@ migrate_containters() {
             fi
         done < <(docker inspect "$container" | jq -c '.[0].Mounts[]')
 
+        # Extract port mappings
+        PORT_OPTS=""
+        while read -r port_mapping; do
+            HOST_IP=$(echo "$port_mapping" | jq -r '.HostIp')
+            HOST_PORT=$(echo "$port_mapping" | jq -r '.HostPort')
+            CONTAINER_PORT=$(echo "$port_mapping" | jq -r '.ContainerPort')
+            PROTOCOL=$(echo "$port_mapping" | jq -r '.Protocol')
+
+            # Construct `-p` option (exclude 0.0.0.0 for readability)
+            if [[ "$HOST_IP" == "0.0.0.0" || -z "$HOST_IP" ]]; then
+                PORT_OPTS+=" -p $HOST_PORT:$CONTAINER_PORT/$PROTOCOL"
+            else
+                PORT_OPTS+=" -p $HOST_IP:$HOST_PORT:$CONTAINER_PORT/$PROTOCOL"
+            fi
+        done < <(docker inspect "$container" | jq -c '.[] | .NetworkSettings.Ports | to_entries[] | {ContainerPort: .key, Protocol: (if .key | contains("udp") then "udp" else "tcp" end), HostMappings: .value} | select(.HostMappings != null) | .HostMappings[] | {HostIp, HostPort, ContainerPort, Protocol}')
+
+        # Extract network information
+        NETWORK_OPTS=""
+        while read -r network; do
+            NETWORK_NAME=$(echo "$network" | jq -r 'keys[0]')
+            NETWORK_IP=$(echo "$network" | jq -r ".$NETWORK_NAME.IPAddress")
+
+            if [[ -n "$NETWORK_NAME" ]]; then
+                NETWORK_OPTS+=" --network=$NETWORK_NAME"
+            fi
+
+            if [[ -n "$NETWORK_IP" ]]; then
+                NETWORK_OPTS+=" --ip=$NETWORK_IP"
+            fi
+        done < <(docker inspect "$container" | jq -c '.[0].NetworkSettings.Networks')
+
         # Run the container with the same name and mounts, including RW/RO options
-        podman run -d --name "$container" $PODMAN_RESTART "$MOUNT_OPTS" "$MIGRATION_CONTAINER_TAG" &&
+        podman run -d --name "$container" $PODMAN_RESTART "$MOUNT_OPTS" "$PORT_OPTS" "$NETWORK_OPTS" "$MIGRATION_CONTAINER_TAG" &&
             echo "Container $container migrated successfully" ||
             echo "Failed to migrate container: $container"
 
@@ -123,9 +227,13 @@ volumes)
 containers)
     migrate_containters
     ;;
+networks)
+    migrate_networks
+    ;;
 full)
     migrate_images
     migrate_volumes
+    migrate_networks
     migrate_containters
     ;;
 *)
@@ -133,6 +241,7 @@ full)
     echo -e "\timages: Migrate Docker images to Podman"
     echo -e "\tvolumes: Migrate Docker volumes to Podman"
     echo -e "\tcontainers: Migrate Docker containers to Podman"
+    echo -e "\tnetworks: Migrate Docker networks to Podman"
     echo -e "\tfull: Migrate Docker images, volumes, and containers to Podman"
     exit 1
     ;;
