@@ -27,9 +27,9 @@ migrate_images() {
 # Migrate volumes
 migrate_volumes() {
     echo "Migrating Docker volumes to Podman..."
-    # Get the path to the Podman volumes directory
+    # Get the path to the Podman volumes directory (and guess at the Docker volumes directory)
     PODMAN_VOLUMES_PATH=$(podman info --format json | jq -r '.store.volumePath')
-    DOCKER_VOLUMES_PATH="/var/lib/docker/volumes"
+    DOCKER_VOLUMES_PATH=$(docker system info -fjson | jq -r '.DockerRootDir')/volumes
 
     RSYNC_OPTS=""
     if [[ "$UID" -ne 0 ]]; then
