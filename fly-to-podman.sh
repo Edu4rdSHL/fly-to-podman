@@ -12,7 +12,7 @@ migrate_images() {
         fi
 
         # Replace slashes in repository names with underscores for filenames
-        filename=$(echo "$image" | tr '/' '_').tar
+        filename=$(echo "$image" | tr '/:' '_').tar
 
         echo "Exporting $image..."
         docker save -o "$filename" "$image" &&
