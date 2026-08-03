@@ -1,6 +1,42 @@
 #!/bin/bash
 # This script is used to migrate from Docker to Podman
 
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+check_dependencies() {
+    local missing=()
+
+    for dep in docker podman jq rsync sudo; do
+        command -v "$dep" >/dev/null 2>&1 || missing+=("$dep")
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "missing required command(s): ${missing[*]}. Install them and try again."
+    fi
+}
+
+check_docker_group() {
+    [[ "$UID" -eq 0 ]] && return 0
+    id -nG | grep -qw docker && return 0
+
+    die "$(id -un) is not in the 'docker' group, so it cannot talk to the Docker daemon.
+    Note: If you run this script with sudo, it would migrate everything into a rootful Podman setup."
+}
+
+check_sudo() {
+    [[ "$UID" -eq 0 ]] && return 0
+    sudo -v || die "sudo is needed to read the Docker volumes data owned by root."
+}
+
+preflight() {
+    check_dependencies
+    check_docker_group
+    check_sudo
+}
+
 # Migrate images
 migrate_images() {
     echo "Migrating Docker images to Podman..."
@@ -31,16 +67,16 @@ migrate_volumes() {
     PODMAN_VOLUMES_PATH=$(podman info --format json | jq -r '.store.volumePath')
     DOCKER_VOLUMES_PATH=$(docker system info -fjson | jq -r '.DockerRootDir')/volumes
 
-    RSYNC_OPTS=""
+    RSYNC_OPTS=(-a)
     if [[ "$UID" -ne 0 ]]; then
         # If not running as root, make sure to chown the files to the current user
-        RSYNC_OPTS+=" --chown=$(id -u):$(id -g)"
+        RSYNC_OPTS+=("--chown=$(id -u):$(id -g)")
     fi
 
     for volume in $(docker volume ls --format json | jq -r '.Name'); do
         echo "Migrating volume: $volume"
         podman volume create "$volume" &&
-            sudo rsync -a "$RSYNC_OPTS" "$DOCKER_VOLUMES_PATH/$volume/_data/" "$PODMAN_VOLUMES_PATH/$volume/_data"
+            sudo rsync "${RSYNC_OPTS[@]}" "$DOCKER_VOLUMES_PATH/$volume/_data/" "$PODMAN_VOLUMES_PATH/$volume/_data"
     done
 }
 
@@ -224,6 +260,21 @@ migrate_containters() {
 
 # Process arguments
 case "$1" in
+images | volumes | containers | networks | full)
+    preflight
+    ;;
+*)
+    echo "Usage: $0 {images|volumes|containers|full}"
+    echo -e "\timages: Migrate Docker images to Podman"
+    echo -e "\tvolumes: Migrate Docker volumes to Podman"
+    echo -e "\tcontainers: Migrate Docker containers to Podman"
+    echo -e "\tnetworks: Migrate Docker networks to Podman"
+    echo -e "\tfull: Migrate Docker images, volumes, and containers to Podman"
+    exit 1
+    ;;
+esac
+
+case "$1" in
 images)
     migrate_images
     ;;
@@ -241,14 +292,5 @@ full)
     migrate_volumes
     migrate_networks
     migrate_containters
-    ;;
-*)
-    echo "Usage: $0 {images|volumes|containers|full}"
-    echo -e "\timages: Migrate Docker images to Podman"
-    echo -e "\tvolumes: Migrate Docker volumes to Podman"
-    echo -e "\tcontainers: Migrate Docker containers to Podman"
-    echo -e "\tnetworks: Migrate Docker networks to Podman"
-    echo -e "\tfull: Migrate Docker images, volumes, and containers to Podman"
-    exit 1
     ;;
 esac

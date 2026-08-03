@@ -20,6 +20,7 @@ Full blog post: [From Docker to Podman: full migration to rootless](https://www.
 - bash
 - jq
 - rsync
+- sudo, if your Docker data is owned by root (the usual case with rootful Docker)
 
 # Usage
 
@@ -31,6 +32,20 @@ fly-to-podman.sh {images|volumes|containers|full}
         networks: Migrate Docker networks to Podman
         full: Migrate Docker images, volumes, and containers to Podman
 ```
+
+# Permissions
+
+Run it as your normal user, not with `sudo`. Podman takes its storage from the user running it, so `sudo fly-to-podman.sh` migrates everything into root's storage and you end up with a rootful Podman setup instead of a rootless one.
+
+Your user needs to be in the `docker` group to talk to the Docker daemon:
+
+```bash
+sudo usermod -aG docker "$USER"
+```
+
+Log out and back in afterwards so that the new group gets recognized.
+
+The volumes data in `DockerRootDir` may be owned by root, so it is copied with `sudo rsync` and chowned to your user.
 
 # Issues and contributions
 
