@@ -6,10 +6,18 @@ die() {
     exit 1
 }
 
+is_macos() {
+    [[ "$(uname -s)" == "Darwin" ]]
+}
+
 check_dependencies() {
     local missing=()
+    local deps=(docker podman jq)
 
-    for dep in docker podman jq rsync sudo; do
+    # rsync/sudo are only needed for the Linux volume migration path
+    is_macos || deps+=(rsync sudo)
+
+    for dep in "${deps[@]}"; do
         command -v "$dep" >/dev/null 2>&1 || missing+=("$dep")
     done
 
@@ -19,6 +27,12 @@ check_dependencies() {
 }
 
 check_docker_group() {
+    # macOS has no 'docker' group: Docker Desktop exposes a user-owned socket
+    if is_macos; then
+        docker info >/dev/null 2>&1 && return 0
+        die "cannot talk to the Docker daemon. Is Docker Desktop running?"
+    fi
+
     [[ "$UID" -eq 0 ]] && return 0
     id -nG | grep -qw docker && return 0
 
@@ -27,6 +41,8 @@ check_docker_group() {
 }
 
 check_sudo() {
+    # Not needed on macOS: volumes are migrated through the engines, not host paths
+    is_macos && return 0
     [[ "$UID" -eq 0 ]] && return 0
     sudo -v || die "sudo is needed to read the Docker volumes data owned by root."
 }
@@ -35,6 +51,11 @@ preflight() {
     check_dependencies
     check_docker_group
     check_sudo
+
+    if is_macos; then
+        podman info >/dev/null 2>&1 ||
+            die "cannot talk to Podman. Is the podman machine running? (podman machine start)"
+    fi
 }
 
 # Migrate images
@@ -47,8 +68,9 @@ migrate_images() {
             continue
         fi
 
-        # Replace slashes in repository names with underscores for filenames
-        filename=$(echo "$image" | tr '/' '_').tar
+        # Replace slashes and colons in image references with underscores for filenames
+        # (a colon in the path makes `podman load` misparse it as a transport reference)
+        filename=$(echo "$image" | tr '/:' '_').tar
 
         echo "Exporting $image..."
         docker save -o "$filename" "$image" &&
@@ -63,20 +85,31 @@ migrate_images() {
 # Migrate volumes
 migrate_volumes() {
     echo "Migrating Docker volumes to Podman..."
-    # Get the path to the Podman volumes directory (and guess at the Docker volumes directory)
-    PODMAN_VOLUMES_PATH=$(podman info --format json | jq -r '.store.volumePath')
-    DOCKER_VOLUMES_PATH=$(docker system info -fjson | jq -r '.DockerRootDir')/volumes
 
-    RSYNC_OPTS=(-a)
-    if [[ "$UID" -ne 0 ]]; then
-        # If not running as root, make sure to chown the files to the current user
-        RSYNC_OPTS+=("--chown=$(id -u):$(id -g)")
+    if ! is_macos; then
+        # Get the path to the Podman volumes directory (and guess at the Docker volumes directory)
+        PODMAN_VOLUMES_PATH=$(podman info --format json | jq -r '.store.volumePath')
+        DOCKER_VOLUMES_PATH=$(docker system info -fjson | jq -r '.DockerRootDir')/volumes
+
+        RSYNC_OPTS=(-a)
+        if [[ "$UID" -ne 0 ]]; then
+            # If not running as root, make sure to chown the files to the current user
+            RSYNC_OPTS+=("--chown=$(id -u):$(id -g)")
+        fi
     fi
 
     for volume in $(docker volume ls --format json | jq -r '.Name'); do
         echo "Migrating volume: $volume"
-        podman volume create "$volume" &&
-            sudo rsync "${RSYNC_OPTS[@]}" "$DOCKER_VOLUMES_PATH/$volume/_data/" "$PODMAN_VOLUMES_PATH/$volume/_data"
+        if is_macos; then
+            # Both engines run inside VMs on macOS, so host paths do not exist.
+            # Stream the volume contents through the engines instead.
+            podman volume create "$volume" &&
+                docker run --rm -v "$volume":/from alpine tar -cf - -C /from . |
+                podman run --rm -i -v "$volume":/to alpine tar -xf - -C /to
+        else
+            podman volume create "$volume" &&
+                sudo rsync "${RSYNC_OPTS[@]}" "$DOCKER_VOLUMES_PATH/$volume/_data/" "$PODMAN_VOLUMES_PATH/$volume/_data"
+        fi
     done
 }
 
@@ -88,8 +121,8 @@ migrate_networks() {
     for network in $(docker network ls --format '{{json . }}' | jq -r '.Name'); do
         echo "Processing network: $network"
 
-        # Skip default Docker networks
-        if [[ "$network" == "host" || "$network" == "none" ]]; then
+        # Skip default Docker networks (bridge is a reserved network mode in Podman)
+        if [[ "$network" == "host" || "$network" == "none" || "$network" == "bridge" ]]; then
             echo "Skipping network: $network (Podman does not need it)"
             continue
         fi
@@ -186,7 +219,7 @@ migrate_containters() {
         }
 
         # Extract volume/bind mount information from Docker container
-        MOUNT_OPTS=""
+        MOUNT_OPTS=()
         while read -r mount; do
             MOUNT_TYPE=$(echo "$mount" | jq -r '.Type')
             SOURCE=$(echo "$mount" | jq -r '.Source')
@@ -206,48 +239,65 @@ migrate_containters() {
                 MODE+=",U"
                 # Attach existing named volume
                 VOLUME_NAME=$(echo "$mount" | jq -r '.Name')
-                MOUNT_OPTS+=" -v $VOLUME_NAME:$DESTINATION:$MODE"
+                MOUNT_OPTS+=(-v "$VOLUME_NAME:$DESTINATION:$MODE")
             elif [[ "$MOUNT_TYPE" == "bind" ]]; then
                 # Use :Z if you're using SELinux to ensure right permissions inside the container
                 # MODE+=",Z"
+                # Docker Desktop on macOS reports some bind sources with a /host_mnt
+                # prefix (the VM-internal mount of the host filesystem); strip it to
+                # get the real host path
+                is_macos && SOURCE="${SOURCE#/host_mnt}"
                 # Ensure the source path exists before mounting
-                [[ -e "$SOURCE" ]] && MOUNT_OPTS+=" -v $SOURCE:$DESTINATION:$MODE"
+                [[ -e "$SOURCE" ]] && MOUNT_OPTS+=(-v "$SOURCE:$DESTINATION:$MODE")
             fi
         done < <(docker inspect "$container" | jq -c '.[0].Mounts[]')
 
         # Extract port mappings
-        PORT_OPTS=""
+        PORT_OPTS=()
         while read -r port_mapping; do
             HOST_IP=$(echo "$port_mapping" | jq -r '.HostIp')
             HOST_PORT=$(echo "$port_mapping" | jq -r '.HostPort')
             CONTAINER_PORT=$(echo "$port_mapping" | jq -r '.ContainerPort')
             PROTOCOL=$(echo "$port_mapping" | jq -r '.Protocol')
 
+            # Stopped containers can inspect with null port values; skip those
+            if [[ -z "$HOST_PORT" || "$HOST_PORT" == "null" || -z "$CONTAINER_PORT" || "$CONTAINER_PORT" == "null" ]]; then
+                continue
+            fi
+            # Strip the /tcp|/udp suffix jq leaves on the container port key
+            CONTAINER_PORT=${CONTAINER_PORT%%/*}
+
             # Construct `-p` option (exclude 0.0.0.0 for readability)
             if [[ "$HOST_IP" == "0.0.0.0" || -z "$HOST_IP" ]]; then
-                PORT_OPTS+=" -p $HOST_PORT:$CONTAINER_PORT/$PROTOCOL"
+                PORT_OPTS+=(-p "$HOST_PORT:$CONTAINER_PORT/$PROTOCOL")
             else
-                PORT_OPTS+=" -p $HOST_IP:$HOST_PORT:$CONTAINER_PORT/$PROTOCOL"
+                PORT_OPTS+=(-p "$HOST_IP:$HOST_PORT:$CONTAINER_PORT/$PROTOCOL")
             fi
-        done < <(docker inspect "$container" | jq -c '.[] | .NetworkSettings.Ports | to_entries[] | {ContainerPort: .key, Protocol: (if .key | contains("udp") then "udp" else "tcp" end), HostMappings: .value} | select(.HostMappings != null) | .HostMappings[] | {HostIp, HostPort, ContainerPort, Protocol}')
+        done < <(docker inspect "$container" | jq -c '.[0].HostConfig.PortBindings // {} | to_entries[] | {ContainerPort: (.key | split("/")[0]), Protocol: (if .key | contains("udp") then "udp" else "tcp" end), HostMappings: .value} | select(.HostMappings != null) | . as $p | $p.HostMappings[] | {HostIp, HostPort, ContainerPort: $p.ContainerPort, Protocol: $p.Protocol}')
 
         # Extract network information
-        NETWORK_OPTS=""
+        NETWORK_OPTS=()
         while read -r network; do
             NETWORK_NAME=$(echo "$network" | jq -r 'keys[0]')
             NETWORK_IP=$(echo "$network" | jq -r ".$NETWORK_NAME.IPAddress")
 
-            if [[ -n "$NETWORK_NAME" ]]; then
-                NETWORK_OPTS+=" --network=$NETWORK_NAME"
+            # Stopped containers can inspect with no/null networks; only attach
+            # networks that actually exist in Podman
+            if [[ -n "$NETWORK_NAME" && "$NETWORK_NAME" != "null" ]]; then
+                if podman network exists "$NETWORK_NAME" 2>/dev/null || [[ "$NETWORK_NAME" == "bridge" ]]; then
+                    NETWORK_OPTS+=("--network=$NETWORK_NAME")
+                else
+                    echo "Warning: network $NETWORK_NAME not found in Podman; using default network for $container"
+                fi
             fi
 
-            if [[ -n "$NETWORK_IP" ]]; then
-                NETWORK_OPTS+=" --ip=$NETWORK_IP"
+            if [[ -n "$NETWORK_IP" && "$NETWORK_IP" != "null" ]]; then
+                NETWORK_OPTS+=("--ip=$NETWORK_IP")
             fi
         done < <(docker inspect "$container" | jq -c '.[0].NetworkSettings.Networks')
 
         # Run the container with the same name and mounts, including RW/RO options
-        podman run -d --name "$container" $PODMAN_RESTART "$MOUNT_OPTS" "$PORT_OPTS" "$NETWORK_OPTS" "$MIGRATION_CONTAINER_TAG" &&
+        podman run -d --name "$container" $PODMAN_RESTART "${MOUNT_OPTS[@]}" "${PORT_OPTS[@]}" "${NETWORK_OPTS[@]}" "$MIGRATION_CONTAINER_TAG" &&
             echo "Container $container migrated successfully" ||
             echo "Failed to migrate container: $container"
 
@@ -255,6 +305,9 @@ migrate_containters() {
         if [[ "$WAS_RUNNING" == "false" ]]; then
             podman stop "$container"
         fi
+
+        # Remove temporary file
+        rm -f "$container_lc".tar
     done
 }
 
