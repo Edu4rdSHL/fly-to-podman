@@ -312,38 +312,56 @@ migrate_containters() {
 }
 
 # Process arguments
-case "$1" in
-images | volumes | containers | networks | full)
-    preflight
-    ;;
-*)
-    echo "Usage: $0 {images|volumes|containers|full}"
+if [[ $# -lt 1 ]]; then
+    echo "Usage: $0 {images|volumes|containers|networks|full} [...]"
     echo -e "\timages: Migrate Docker images to Podman"
     echo -e "\tvolumes: Migrate Docker volumes to Podman"
     echo -e "\tcontainers: Migrate Docker containers to Podman"
     echo -e "\tnetworks: Migrate Docker networks to Podman"
-    echo -e "\tfull: Migrate Docker images, volumes, and containers to Podman"
+    echo -e "\tfull: Migrate Docker images, volumes, containers and networks to Podman"
+    echo -e "\nNote: 'full' cannot be combined with other arguments"
     exit 1
-    ;;
-esac
+fi
 
-case "$1" in
-images)
-    migrate_images
-    ;;
-volumes)
-    migrate_volumes
-    ;;
-containers)
-    migrate_containters
-    ;;
-networks)
-    migrate_networks
-    ;;
-full)
-    migrate_images
-    migrate_volumes
-    migrate_networks
-    migrate_containters
-    ;;
-esac
+MIGRATIONS=()
+FULL=0
+
+for arg in "$@"; do
+    case "$arg" in
+        images|volumes|containers|networks)
+            MIGRATIONS+=("$arg")
+            ;;
+        full)
+            FULL=1
+            ;;
+        *)
+            die "Unknown migration: $arg. Usage: $0 {images|volumes|containers|networks|full}"
+            ;;
+    esac
+done
+
+if [[ $FULL -eq 1 ]]; then
+    if [[ ${#MIGRATIONS[@]} -gt 0 ]]; then
+        echo "Warning: 'full' and other arguments are mutually exclusive. Preferring 'full'." >&2
+    fi
+    MIGRATIONS=(images volumes networks containers)
+fi
+
+preflight
+
+for migration in "${MIGRATIONS[@]}"; do
+    case "$migration" in
+        images)
+            migrate_images
+            ;;
+        volumes)
+            migrate_volumes
+            ;;
+        containers)
+            migrate_containters
+            ;;
+        networks)
+            migrate_networks
+            ;;
+    esac
+done
