@@ -323,13 +323,13 @@ migrate_containters() {
 
 # Process arguments
 if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 {images|volumes|containers|networks|full} [...]"
+    echo "Usage: $0 {containers|images|networks|volumes|full} [...]"
     echo -e "\timages: Migrate Docker images to Podman"
     echo -e "\tvolumes: Migrate Docker volumes to Podman"
     echo -e "\tcontainers: Migrate Docker containers to Podman"
     echo -e "\tnetworks: Migrate Docker networks to Podman"
-    echo -e "\tfull: Migrate Docker images, volumes, containers and networks to Podman"
-    echo -e "\nNote: 'full' cannot be combined with other arguments"
+    echo -e "\tfull: Migrate Docker containers, images, networks and volumes to Podman"
+    echo -e "\nNote: 'full' is mutually exclusive and cannot be combined with other arguments"
     exit 1
 fi
 
@@ -338,14 +338,14 @@ FULL=0
 
 for arg in "$@"; do
     case "$arg" in
-        images|volumes|containers|networks)
+        containers|images|networks|volumes)
             MIGRATIONS+=("$arg")
             ;;
         full)
             FULL=1
             ;;
         *)
-            die "Unknown migration: $arg. Usage: $0 {images|volumes|containers|networks|full}"
+            die "Unknown migration: $arg. Usage: $0 {containers|images|networks|volumes|full}"
             ;;
     esac
 done
@@ -354,24 +354,24 @@ if [[ $FULL -eq 1 ]]; then
     if [[ ${#MIGRATIONS[@]} -gt 0 ]]; then
         echo "Warning: 'full' and other arguments are mutually exclusive. Preferring 'full'." >&2
     fi
-    MIGRATIONS=(images volumes networks containers)
+    MIGRATIONS=(containers images networks volumes)
 fi
 
 preflight
 
 for migration in "${MIGRATIONS[@]}"; do
     case "$migration" in
-        images)
-            migrate_images
-            ;;
-        volumes)
-            migrate_volumes
-            ;;
         containers)
             migrate_containters
             ;;
+        images)
+            migrate_images
+            ;;
         networks)
             migrate_networks
+            ;;
+        volumes)
+            migrate_volumes
             ;;
     esac
 done
