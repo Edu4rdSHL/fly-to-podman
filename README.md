@@ -25,13 +25,26 @@ Full blog post: [From Docker to Podman: full migration to rootless](https://www.
 # Usage
 
 ```bash
-fly-to-podman.sh {images|volumes|containers|full}
+fly-to-podman.sh {containers|images|networks|volumes|full} [...]
         images: Migrate Docker images to Podman
         volumes: Migrate Docker volumes to Podman
         containers: Migrate Docker containers to Podman
         networks: Migrate Docker networks to Podman
-        full: Migrate Docker images, volumes, and containers to Podman
+        full: Migrate Docker containers, images, networks, and volumes to Podman.
 ```
+
+You can specify multiple arguments to migrate only what you need:
+- `./fly-to-podman.sh containers` - migrate only containers (existing flow)
+- `./fly-to-podman.sh containers images` - migrate containers and
+  images
+- `./fly-to-podman.sh images networks` - migrate images and networks -
+  or any other combination
+- `./fly-to-podman.sh full` - migrate everything
+
+Note: 'full' is mutually exclusive and cannot be combined with other
+arguments. When combined with other arguments, the script will prefer
+full over the other arguments. It will not fail, it will emit a
+warning and migrate all supported objects
 
 # Permissions
 
