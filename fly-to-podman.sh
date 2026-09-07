@@ -11,12 +11,21 @@ is_macos() {
 }
 
 check_dependencies() {
+    local -a migrations=("$@")
     local missing=()
-    local deps=(docker podman jq)
+    local deps=(docker podman)
 
-    # rsync/sudo are only needed for the Linux volume migration path
-    is_macos || deps+=(rsync sudo)
+    # jq is not required for images
+    if [[ " ${migrations[*]} " =~ " (volumes|containers|networks) " ]]; then
+        deps+=(jq)
+    fi
 
+    # sudo/rsync only needed for volume migration on Linux
+    if [[ " ${migrations[*]} " =~ " volumes " ]] && ! is_macos; then
+        deps+=(sudo rsync)
+    fi
+
+    # Check all required deps
     for dep in "${deps[@]}"; do
         command -v "$dep" >/dev/null 2>&1 || missing+=("$dep")
     done
@@ -48,7 +57,8 @@ check_sudo() {
 }
 
 preflight() {
-    check_dependencies
+    local -a migrations=("$@")
+    check_dependencies "${migrations[@]}"
     check_docker_group
     check_sudo
 
